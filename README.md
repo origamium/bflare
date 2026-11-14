@@ -2,6 +2,8 @@
 
 [日本語](#日本語) | [English](#english)
 
+![](./misc/screenshot.png)
+
 ---
 
 ## 日本語
