@@ -1,9 +1,9 @@
 bl_info = {
-    "name": "PostFX Lens",
-    "author": "local",
+    "name": "bflare",
+    "author": "origamium",
     "version": (0, 5, 2),
     "blender": (5, 3, 0),
-    "location": "3D Viewport > Sidebar > PostFX",
+    "location": "3D Viewport > Sidebar > bflare",
     "description": "Post effect chain on the compositor with looks and measured lens profiles",
     "category": "Compositing",
 }
@@ -1109,11 +1109,11 @@ class PF_OT_remove(bpy.types.Operator):
 
 
 class PF_PT_panel(bpy.types.Panel):
-    bl_label = "PostFX Lens"
+    bl_label = "bflare"
     bl_idname = "PF_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "PostFX"
+    bl_category = "bflare"
 
     def draw_header(self, context):
         if _tree(context.scene):
@@ -1393,7 +1393,7 @@ def register():
         name="F-Stop", description="Aperture of the mounted lens; cannot open wider than its maximum",
         default=2.8, min=0.7, soft_max=22.0, max=64.0, precision=2, update=_fstop_update)
     S.postfx_enabled = bpy.props.BoolProperty(
-        name="PostFX", description="Run the post effect chain in the viewport and the render. Turn off to work in a "
+        name="bflare", description="Run the post effect chain in the viewport and the render. Turn off to work in a "
         "heavy scene; every setting is kept", default=True, update=_enabled_update)
     S.postfx_tree = bpy.props.PointerProperty(type=bpy.types.NodeTree, options={'HIDDEN'})
     S.postfx_optics = bpy.props.PointerProperty(type=PF_Optics)
