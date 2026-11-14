@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import math
+from contextlib import contextmanager
 
 import bpy
 import numpy as np
@@ -16,8 +17,7 @@ from bpy.app.handlers import persistent
 
 # shortcut: uses scene.compositing_node_group (deprecated for 6.0), port when upgrading.
 GROUP = "PostFX Lens"
-VERSION = 9
-SUBGROUPS = ("PostFX Bokeh", "PostFX Star", "PostFX Streak", "PostFX Squeeze", "PostFX Vignette", "PostFX Veil", "PostFX Tone", "PostFX Grain")
+VERSION = 9  # bump whenever the nodes _build creates change, so old chains ask to be rebuilt
 
 # Chain order = list order. (node name, node type or sub-group, fixed values)
 CHAIN = [
@@ -297,36 +297,51 @@ def _new_group(name, inputs):
     return g, g.nodes.new("NodeGroupInput"), g.nodes.new("NodeGroupOutput")
 
 
+def _feed(g, sock, v):
+    """Set a constant on an input socket, or link an output socket into it."""
+    if isinstance(v, (int, float)):
+        sock.default_value = v
+    else:
+        g.links.new(v, sock)
+
+
 def _math(g, op, a, b=None):
     n = g.nodes.new("ShaderNodeMath")
     n.operation = op
     for i, v in enumerate((a, b)):
-        if v is None:
-            continue
-        if isinstance(v, (int, float)):
-            n.inputs[i].default_value = v
-        else:
-            g.links.new(v, n.inputs[i])
+        if v is not None:
+            _feed(g, n.inputs[i], v)
     return n.outputs[0]
 
 
-def _multiply(g, image, factor):
+def _mix(g, fac, a, b, blend='MIX'):
     n = g.nodes.new("ShaderNodeMix")
-    n.data_type, n.blend_type = 'RGBA', 'MULTIPLY'
-    n.inputs[0].default_value = 1.0
-    g.links.new(image, n.inputs[6])
-    g.links.new(factor, n.inputs[7])
+    n.data_type, n.blend_type = 'RGBA', blend
+    _feed(g, n.inputs[0], fac)
+    # The Mix node keeps float, vector and colour sockets side by side; 6, 7 and 2 are the colour ones.
+    g.links.new(a, n.inputs[6])
+    g.links.new(b, n.inputs[7])
     return n.outputs[2]
+
+
+def _multiply(g, image, factor):
+    return _mix(g, 1.0, image, factor, 'MULTIPLY')
+
+
+def _size(g, image):
+    """Width and height of an image, as sockets."""
+    info = g.nodes.new("CompositorNodeImageInfo")
+    g.links.new(image, info.inputs[0])
+    dim = g.nodes.new("ShaderNodeSeparateXYZ")
+    g.links.new(info.outputs["Dimensions"], dim.inputs[0])
+    return dim.outputs[0], dim.outputs[1]
 
 
 def _scale(g, sock, factor):
     n = g.nodes.new("CompositorNodeScale")
     n.inputs["Type"].default_value = "Relative"
     for axis in ("X", "Y"):
-        if isinstance(factor, (int, float)):
-            n.inputs[axis].default_value = factor
-        else:
-            g.links.new(factor, n.inputs[axis])
+        _feed(g, n.inputs[axis], factor)
     # Clip would sample black past the border and darken the outermost pixels.
     n.inputs["Extension X"].default_value = n.inputs["Extension Y"].default_value = "Extend"
     g.links.new(sock, n.inputs["Image"])
@@ -348,11 +363,7 @@ def _kernel_glare(name, kernel, threshold):
     # The glare node normalises each colour channel of the kernel on its own, so colour is applied after it.
     tint = g.interface.new_socket("Tint", in_out='INPUT', socket_type='NodeSocketColor')
     tint.default_value = (1.0, 1.0, 1.0, 1.0)
-    info = g.nodes.new("CompositorNodeImageInfo")
-    g.links.new(gi.outputs["Image"], info.inputs[0])
-    dim = g.nodes.new("ShaderNodeSeparateXYZ")
-    g.links.new(info.outputs["Dimensions"], dim.inputs[0])
-    down = _math(g, 'MINIMUM', _math(g, 'DIVIDE', STAR_RES, _math(g, 'MAXIMUM', dim.outputs[0], dim.outputs[1])), 1.0)
+    down = _math(g, 'MINIMUM', _math(g, 'DIVIDE', STAR_RES, _math(g, 'MAXIMUM', *_size(g, gi.outputs["Image"]))), 1.0)
     glare = g.nodes.new("CompositorNodeGlare")
     _set(glare, {"Type": "Kernel", "Quality": "High", "Kernel Data Type": "Color", "Smoothness": 0.5})
     g.links.new(_scale(g, gi.outputs["Image"], down), glare.inputs["Image"])
@@ -361,13 +372,9 @@ def _kernel_glare(name, kernel, threshold):
     k = g.nodes.new("CompositorNodeImage")
     k.name = kernel
     g.links.new(k.outputs[0], _sock(glare, "Color Kernel"))
-    add = g.nodes.new("ShaderNodeMix")
-    add.data_type, add.blend_type = 'RGBA', 'ADD'
-    add.inputs[0].default_value = 1.0
-    g.links.new(gi.outputs["Image"], add.inputs[6])
     glow = _multiply(g, glare.outputs["Glare"], gi.outputs["Tint"])
-    g.links.new(_scale(g, glow, _math(g, 'DIVIDE', 1.0, down)), add.inputs[7])
-    g.links.new(add.outputs[2], go.inputs["Image"])
+    glow = _scale(g, glow, _math(g, 'DIVIDE', 1.0, down))
+    g.links.new(_mix(g, 1.0, gi.outputs["Image"], glow, 'ADD'), go.inputs["Image"])
     return g
 
 
@@ -381,12 +388,9 @@ def _squeeze():
     uv = g.nodes.new("ShaderNodeSeparateXYZ")
     g.links.new(co.outputs["Uniform"], uv.inputs[0])
     u, v = uv.outputs[0], uv.outputs[1]
-    info = g.nodes.new("CompositorNodeImageInfo")
-    g.links.new(gi.outputs["Image"], info.inputs[0])
-    dim = g.nodes.new("ShaderNodeSeparateXYZ")
-    g.links.new(info.outputs["Dimensions"], dim.inputs[0])
-    longest = _math(g, 'MAXIMUM', dim.outputs[0], dim.outputs[1])
-    aspect = _math(g, 'DIVIDE', _math(g, 'MINIMUM', dim.outputs[0], dim.outputs[1]), longest)
+    w, h = _size(g, gi.outputs["Image"])
+    longest = _math(g, 'MAXIMUM', w, h)
+    aspect = _math(g, 'DIVIDE', _math(g, 'MINIMUM', w, h), longest)
     rc2 = (FF_CORNER / 18.0) ** 2
     kx = _math(g, 'MULTIPLY', gi.outputs["Horizontal"], -0.01 / rc2)
     ky = _math(g, 'MULTIPLY', gi.outputs["Vertical"], -0.01 / rc2)
@@ -428,12 +432,7 @@ def _veil():
     g, gi, go = _new_group("PostFX Veil", [("Amount", 0.0, 0.0, 1.0)])
     lv = g.nodes.new("CompositorNodeLevels")
     g.links.new(gi.outputs["Image"], lv.inputs["Image"])
-    mx = g.nodes.new("ShaderNodeMix")
-    mx.data_type = 'RGBA'
-    g.links.new(gi.outputs["Amount"], mx.inputs[0])
-    g.links.new(gi.outputs["Image"], mx.inputs[6])
-    g.links.new(lv.outputs["Mean"], mx.inputs[7])
-    g.links.new(mx.outputs[2], go.inputs["Image"])
+    g.links.new(_mix(g, gi.outputs["Amount"], gi.outputs["Image"], lv.outputs["Mean"]), go.inputs["Image"])
     return g
 
 
@@ -478,8 +477,6 @@ def _grain():
     k = _math(g, 'ADD', 1.0, _math(g, 'MULTIPLY', _math(g, 'SUBTRACT', sep.outputs[0], 0.5), gain))
     g.links.new(_multiply(g, gi.outputs["Image"], k), go.inputs["Image"])
     return g
-
-
 
 
 # ---------------------------------------------------------------- optics: point spread functions
@@ -691,25 +688,13 @@ def _rebuild_bokeh(g, zones):
         return n.outputs[0]
 
     def mix(fac, a, b, blend='MIX'):
-        n = g.nodes.new("ShaderNodeMix")
-        n.data_type, n.blend_type = 'RGBA', blend
-        if isinstance(fac, (int, float)):
-            n.inputs[0].default_value = fac
-        else:
-            g.links.new(fac, n.inputs[0])
-        g.links.new(a, n.inputs[6])
-        g.links.new(b, n.inputs[7])
-        return n.outputs[2]
+        return _mix(g, fac, a, b, blend)
 
     def ramp(px):
         # 0 below half a pixel of blur, 1 from two pixels: there the low-resolution blur takes over.
         return _math(g, 'MINIMUM', _math(g, 'MAXIMUM', _math(g, 'DIVIDE', _math(g, 'SUBTRACT', px, 0.5), 1.5), 0.0), 1.0)
 
-    info = g.nodes.new("CompositorNodeImageInfo")
-    g.links.new(inp["Image"], info.inputs[0])
-    dim = g.nodes.new("ShaderNodeSeparateXYZ")
-    g.links.new(info.outputs["Dimensions"], dim.inputs[0])
-    width = _math(g, 'MAXIMUM', dim.outputs[0], dim.outputs[1])
+    width = _math(g, 'MAXIMUM', *_size(g, inp["Image"]))
     f = _math(g, 'DIVIDE', inp["Focal"], 1000.0)
     sensor = _math(g, 'DIVIDE', inp["Sensor"], 1000.0)
     # Radius in pixels: 0.5 f^2 / (N (s - f)) * (z - s) / z, as a fraction of the sensor width.
@@ -827,6 +812,12 @@ def _bokeh():
     return g
 
 
+def _camera(scene):
+    """The scene camera's data, or None when the scene has no camera object."""
+    c = scene.camera
+    return c.data if c and c.type == 'CAMERA' else None
+
+
 def focus_depth(cam_obj):
     cam = cam_obj.data
     if cam.dof.focus_object:
@@ -841,10 +832,10 @@ def sync(scene):
         return
     node, star_node = t.nodes.get("PF_Bokeh"), t.nodes.get("PF_Star")
     star = star_node.node_tree.nodes.get("K_Star") if star_node else None
-    cam_obj = scene.camera if scene.camera and scene.camera.type == 'CAMERA' else None
-    if node is None or cam_obj is None:
+    cam = _camera(scene)
+    if node is None or cam is None:
         return
-    cam, op = cam_obj.data, scene.postfx_optics
+    op = scene.postfx_optics
     optical = scene.postfx_dof == 'OPTICAL'
     if node.mute == optical:
         node.mute = not optical
@@ -858,7 +849,7 @@ def sync(scene):
     r = scene.render
     render_width = max(r.resolution_x, r.resolution_y) * r.resolution_percentage // 100
     ratio = cam.dof.aperture_ratio
-    for key, value in (("Focus", focus_depth(cam_obj)), ("Focal", cam.lens), ("F-Stop", fstop),
+    for key, value in (("Focus", focus_depth(scene.camera)), ("Focal", cam.lens), ("F-Stop", fstop),
                        ("Sensor", cam.sensor_width), ("Max Radius", op.max_blur), ("Kernel Scale", _kernel_half(o, stop)),
                        ("Render Width", render_width), ("Render Res", op.render_res), ("Viewport Res", op.viewport_res)):
         if abs(node.inputs[key].default_value - value) > 1e-6:
@@ -891,8 +882,9 @@ def sync(scene):
     t["postfx_sig"] = sig
 
 
-
-BUILDERS = {"PostFX Bokeh": _bokeh, "PostFX Star": _star, "PostFX Streak": _streak, "PostFX Squeeze": _squeeze, "PostFX Vignette": _vignette, "PostFX Veil": _veil, "PostFX Tone": _tone, "PostFX Grain": _grain}
+# Sub-group name -> function that creates it. CHAIN refers to these by name.
+BUILDERS = {"PostFX Bokeh": _bokeh, "PostFX Star": _star, "PostFX Streak": _streak, "PostFX Squeeze": _squeeze,
+            "PostFX Vignette": _vignette, "PostFX Veil": _veil, "PostFX Tone": _tone, "PostFX Grain": _grain}
 
 
 # ---------------------------------------------------------------- chain
@@ -912,7 +904,7 @@ def _remove(scene):
             scene.compositing_node_group = None
         scene.postfx_tree = None
         bpy.data.node_groups.remove(t)
-    for name in SUBGROUPS:
+    for name in BUILDERS:
         g = bpy.data.node_groups.get(name)
         if g and g.users == 0:
             bpy.data.node_groups.remove(g)
@@ -970,20 +962,28 @@ def apply_preset(scene, preset):
         n.mute = name not in values
 
 
-_busy = False
+_busy = False  # True while the add-on itself sets properties; the update callbacks then do nothing
+
+
+@contextmanager
+def _quiet():
+    global _busy
+    prev, _busy = _busy, True
+    try:
+        yield
+    finally:
+        _busy = prev
 
 
 def apply_lens(scene):
     """Mount the selected lens: its optics replace the look's, and the camera takes its focal length and iris."""
-    global _busy
     t, spec = _tree(scene), LENSES.get(scene.postfx_lens)
     if not t or not spec:
         return
     fstop = max(scene.postfx_fstop, spec["fmax"])
     if fstop != scene.postfx_fstop:
-        _busy = True
-        scene.postfx_fstop = fstop
-        _busy = False
+        with _quiet():
+            scene.postfx_fstop = fstop
     res = scene.render
     aspect = min(res.resolution_x, res.resolution_y) / max(res.resolution_x, res.resolution_y)
     values = lens_values(spec, fstop, aspect)
@@ -994,9 +994,8 @@ def apply_lens(scene):
         _set(n, NEUTRAL[name])
         _set(n, values.get(name, {}))
         n.mute = name not in values
-    cam = scene.camera.data if scene.camera and scene.camera.type == 'CAMERA' else None
-    _busy = True
-    try:
+    cam = _camera(scene)
+    with _quiet():
         op, lo = scene.postfx_optics, LENS_OPTICS.get(scene.postfx_lens, {})
         op.blades, op.curvature = spec["blades"], (0.8 if spec["rounded"] else 0.0)
         op.sa, op.loca, op.cat, op.rings = lo.get("sa", 0.0), lo.get("loca", 0.0), lo.get("cat", 0.0), lo.get("rings", 0.0)
@@ -1011,8 +1010,6 @@ def apply_lens(scene):
             cam.dof.aperture_ratio = spec.get("ratio", 1.0)
         if spec.get("streaks"):
             scene.postfx_anamorphic.core = spec["streaks"][1][:3]
-    finally:
-        _busy = False
     sync(scene)
 
 
@@ -1026,11 +1023,7 @@ def apply_all(scene):
 
 def sharp_range(cam_obj):
     """Near and far limits (metres) of acceptable sharpness; far is None when it reaches infinity."""
-    cam = cam_obj.data
-    if cam.dof.focus_object:
-        s = abs((cam_obj.matrix_world.inverted() @ cam.dof.focus_object.matrix_world.translation).z)
-    else:
-        s = cam.dof.focus_distance
+    cam, s = cam_obj.data, focus_depth(cam_obj)
     f = cam.lens / 1000.0
     coc = cam.sensor_width / 1000.0 / 1200.0
     h = f * f / (max(cam.dof.aperture_fstop, 1e-4) * coc) + f
@@ -1082,18 +1075,16 @@ class PF_OT_build(bpy.types.Operator):
         old = _snapshot(_tree(sc))
         _remove(sc)
         t = _build(sc)
-        global _busy
         if old:
             # Rebuilding an existing chain (for example after an update) keeps every value that was set,
             # instead of reloading the look and the lens over the user's adjustments.
             _restore(t, old)
             sync(sc)
             return {'FINISHED'}
-        cam = sc.camera.data if sc.camera and sc.camera.type == 'CAMERA' else None
+        cam = _camera(sc)
         if cam and sc.postfx_dof != 'OPTICAL':
-            _busy = True
-            sc.postfx_dof = 'EEVEE' if cam.dof.use_dof else 'OFF'
-            _busy = False
+            with _quiet():
+                sc.postfx_dof = 'EEVEE' if cam.dof.use_dof else 'OFF'
         apply_all(sc)
         return {'FINISHED'}
 
@@ -1153,7 +1144,7 @@ class PF_PT_panel(bpy.types.Panel):
                 if name == "PF_Star":
                     body.prop(sc.postfx_optics, "star_size")
 
-        cam = sc.camera.data if sc.camera and sc.camera.type == 'CAMERA' else None
+        cam = _camera(sc)
         if cam:
             header, body = lo.panel("postfx_dof", default_closed=True)
             header.label(text="Depth of Field")
@@ -1190,8 +1181,7 @@ class PF_PT_panel(bpy.types.Panel):
                         col.prop(op, "max_aperture")
                     col.prop(op, "max_blur")
                     col.separator()
-                    for key in ("blades", "curvature", "rotation", "sa", "loca", "cat", "rings", "ring_count",
-                                "apodization", "obstruction"):
+                    for key in OPTICS_KEYS:
                         col.prop(op, key)
                 else:
                     sub = col.column()
@@ -1213,7 +1203,7 @@ class PF_PT_panel(bpy.types.Panel):
                 sub.active = not streak.mute
                 sub.prop(_sock(streak, "Strength"), "default_value", text="Strength")
                 sub.prop(_sock(streak, "Threshold"), "default_value", text="Threshold")
-                for key in ("length", "thickness", "falloff", "core", "tip", "lines", "spacing"):
+                for key in ANAMORPHIC_KEYS:
                     row = sub.row()
                     row.active = key != "spacing" or an.lines > 1
                     row.prop(an, key)
@@ -1316,7 +1306,7 @@ class PF_Optics(bpy.types.PropertyGroup):
 def _dof_update(self, context):
     if _busy:
         return
-    cam = self.camera.data if self.camera and self.camera.type == 'CAMERA' else None
+    cam = _camera(self)
     if cam:
         cam.dof.use_dof = self.postfx_dof == 'EEVEE'
     sync(self)
@@ -1339,14 +1329,10 @@ def _enabled_update(self, context):
 @persistent
 def _on_change(scene, *args):
     """Keeps focus distance, f-stop and focal length in step with the camera, also during animation."""
-    global _busy
     if _busy or scene is None or not hasattr(scene, "postfx_dof"):
         return
-    _busy = True
-    try:
+    with _quiet():
         sync(scene)
-    finally:
-        _busy = False
 
 
 @persistent
@@ -1365,12 +1351,10 @@ def _preset_update(self, context):
 
 
 def _lens_update(self, context):
-    global _busy
     spec = LENSES.get(self.postfx_lens)
     if spec:
-        _busy = True
-        self.postfx_fstop = spec["fmax"]
-        _busy = False
+        with _quiet():
+            self.postfx_fstop = spec["fmax"]
     apply_all(self)
 
 
